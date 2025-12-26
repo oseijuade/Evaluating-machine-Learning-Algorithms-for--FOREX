@@ -1,0 +1,236 @@
+# ===============================
+# OSEI KWAME
+# Evaluating Machine Learning Algorithms in Forex Algorithmic Trading
+# INDEX NUMBER PG4913620
+# STUDENT NUMBER 20724624
+# ===============================
+
+
+USE_DQN = True
+
+if USE_DQN:
+    !pip uninstall -y gym
+    !pip install -q yfinance pandas numpy matplotlib scipy scikit-learn tensorflow stable-baselines3 gymnasium
+else:
+    !pip install -q yfinance pandas numpy matplotlib scipy scikit-learn tensorflow
+
+# ---- 1. IMPORTS ----
+import os
+import math
+import warnings
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+from scipy.stats import ttest_1samp
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+if USE_DQN:
+    from stable_baselines3 import DQN
+    import gymnasium as gym
+
+warnings.filterwarnings("ignore")
+plt.style.use("seaborn-v0_8-darkgrid")
+
+# ---- 2. CONFIG ----
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]
+START_DATE = "2010-01-01"
+END_DATE = "2024-12-31"
+ROLLING_STEP_DAYS = 30
+
+SPREAD_PIPS = {
+    "EUR/USD": 0.8,
+    "GBP/USD": 0.8,
+    "USD/JPY": 1.2,
+    "AUD/USD": 1.2
+}
+
+LSTM_WINDOW = 20
+LSTM_EPOCHS = 10
+LSTM_BATCH = 32
+RISK_FREE_DAILY = 0.0
+
+# ---- 3. DATA LOADING ----
+def load_pair(pair):
+    ticker = pair.replace("/", "") + "=X"
+    df = yf.download(ticker, start=START_DATE, end=END_DATE, progress=False)
+    return df[['Close']].ffill()
+
+# ---- 4. FEATURES ----
+def compute_indicators(df):
+    df = df.copy()
+    df['LogRet'] = np.log(df['Close'] / df['Close'].shift(1))
+
+    for i in range(1, 6):
+        df[f'Lag_{i}'] = df['LogRet'].shift(i)
+
+    df['SMA_5'] = df['Close'].rolling(5).mean()
+    df['SMA_20'] = df['Close'].rolling(20).mean()
+    df['Vol_10'] = df['LogRet'].rolling(10).std()
+
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(14).mean() / (loss.rolling(14).mean() + 1e-12)
+    df['RSI_14'] = 100 - (100 / (1 + rs))
+
+    ema12 = df['Close'].ewm(span=12).mean()
+    ema26 = df['Close'].ewm(span=26).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_signal'] = df['MACD'].ewm(span=9).mean()
+
+    df['Label'] = (df['LogRet'].shift(-1) > 0).astype(int)
+    return df.dropna()
+
+# ---- 5. LSTM SEQUENCES ----
+def make_sequences(X, y, window):
+    Xs, ys = [], []
+    for i in range(window, len(X)):
+        Xs.append(X[i-window:i])
+        ys.append(y[i])
+    return np.array(Xs), np.array(ys)
+
+# ---- 6. DQN ENV ----
+class ForexEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self, X, returns, spread):
+        super().__init__()
+        self.X = X.astype(np.float32)
+        self.returns = returns
+        self.spread = spread
+
+        self.action_space = gym.spaces.Discrete(3)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(X.shape[1],), dtype=np.float32
+        )
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.i = 0
+        self.position = 0
+        self.equity = 1.0
+        return self.X[self.i], {}
+
+    def step(self, action):
+        pos = action - 1
+        reward = pos * self.returns[self.i]
+
+        if pos != self.position:
+            reward -= self.spread
+
+        reward -= 0.05 * reward**2
+        self.position = pos
+        self.equity *= np.exp(reward)
+
+        self.i += 1
+        done = self.i >= len(self.returns) - 1
+        obs = self.X[self.i] if not done else self.X[-1]
+        return obs, reward, done, False, {}
+
+# ---- 7. WALK-FORWARD ----
+def walk_forward(df, pair):
+    results = {m: [] for m in ["RF", "SVM", "LSTM", "DQN"]}
+    min_train = 500
+
+    pip_factor = 1e-2 if pair.endswith("JPY") else 1e-4
+    spread = SPREAD_PIPS[pair] * pip_factor
+
+    for t in range(min_train, len(df) - 30, ROLLING_STEP_DAYS):
+        train = df.iloc[:t]
+        test = df.iloc[t:t+30]
+
+        feats = [c for c in train.columns if c not in ['Close','LogRet','Label']]
+        X_train, y_train = train[feats], train['Label']
+        X_test = test[feats]
+
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+
+        # RF
+        rf = RandomForestClassifier(200, n_jobs=-1)
+        rf.fit(X_train, y_train)
+        pos = np.where(rf.predict(X_test)==1, 1, -1)
+        results['RF'] += list(pos * test['LogRet'] - spread)
+
+        # SVM
+        svm = SVC()
+        svm.fit(X_train_s, y_train)
+        pos = np.where(svm.predict(X_test_s)==1, 1, -1)
+        results['SVM'] += list(pos * test['LogRet'] - spread)
+
+        # LSTM
+        X_seq, y_seq = make_sequences(X_train_s, y_train.values, LSTM_WINDOW)
+        if len(X_seq) > 0:
+            lstm = Sequential([
+                LSTM(64, input_shape=X_seq.shape[1:]),
+                Dropout(0.2),
+                Dense(1, activation='sigmoid')
+            ])
+            lstm.compile('adam','binary_crossentropy')
+            lstm.fit(X_seq, y_seq, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH, verbose=0)
+
+            X_test_seq = np.vstack([X_train_s[-LSTM_WINDOW:], X_test_s])
+            X_test_seq, _ = make_sequences(X_test_seq, np.zeros(len(X_test_seq)), LSTM_WINDOW)
+            pos = np.where((lstm.predict(X_test_seq, verbose=0) > 0.5).flatten(), 1, -1)
+            results['LSTM'] += list(pos * test['LogRet'] - spread)
+
+        # DQN
+        env = ForexEnv(X_train_s, train['LogRet'].values, spread)
+        dqn = DQN("MlpPolicy", env, verbose=0)
+        dqn.learn(3000)
+
+        env_test = ForexEnv(X_test_s, test['LogRet'].values, spread)
+        obs,_ = env_test.reset()
+        while True:
+            action,_ = dqn.predict(obs, deterministic=True)
+            obs, r, done, _, _ = env_test.step(action)
+            results['DQN'].append(r)
+            if done:
+                break
+
+    return results
+
+# ---- 8. METRICS ----
+def report(results, pair):
+    print(f"\n=== {pair} ===")
+    rows = []
+    plt.figure(figsize=(10,6))
+
+    for m, rets in results.items():
+        rets = np.array(rets)
+        simple = np.exp(rets) - 1
+        equity = (1 + simple).cumprod()
+
+        sharpe = np.mean(simple) / (np.std(simple) + 1e-12) * np.sqrt(252)
+        maxdd = ((equity - np.maximum.accumulate(equity)) / np.maximum.accumulate(equity)).min()
+
+        rows.append({
+            "Model": m,
+            "Sharpe": f"{sharpe:.2f}",
+            "MaxDD": f"{maxdd:.2%}",
+            "Cumulative": f"{equity[-1]-1:.2%}"
+        })
+
+        plt.plot(equity, label=m)
+
+    plt.legend()
+    plt.title(pair)
+    plt.show()
+    display(pd.DataFrame(rows))
+
+# ---- 9. RUN ----
+for pair in PAIRS:
+    df = compute_indicators(load_pair(pair))
+    res = walk_forward(df, pair)
+    report(res, pair)
+
+print("\nDONE — RF | SVM | LSTM | DQN complete.")
